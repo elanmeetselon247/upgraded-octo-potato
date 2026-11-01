@@ -485,6 +485,17 @@ class TestTls(unittest.TestCase):
             self.assertEqual(ctx.minimum_version, ssl.TLSVersion.TLSv1_2)
             self.assertEqual(ctx.maximum_version, ssl.TLSVersion.TLSv1_2)
 
+    def test_legacy_flag_permits_tls1_0_on_the_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cert, key = Path(tmp) / "c.pem", Path(tmp) / "k.pem"
+            try:
+                sol.generate_self_signed_cert(cert, key)
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                self.skipTest("openssl not available")
+            ctx = sol.server_ssl_context(cert, key, allow_legacy_tls=True)
+            self.assertEqual(ctx.minimum_version, ssl.TLSVersion.TLSv1)
+            self.assertFalse(bool(ctx.options & ssl.OP_NO_TLSv1))
+
 
 class TestTlsSocketRoundTrip(unittest.IsolatedAsyncioTestCase):
     """Full encrypted round trip: the shape a real device connection takes."""
@@ -539,7 +550,56 @@ class TestTlsSocketRoundTrip(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mesh.op_code, sol.OP_SET_POWER)
         self.assertTrue(mesh.checksum_valid)
 
+    async def _handshake_version(self, allow_legacy: bool, version) -> bool:
+        """Return True if a client pinned to ``version`` completes a handshake."""
+        ctx = sol.server_ssl_context(
+            self.cert, self.key, allow_legacy_tls=allow_legacy
+        )
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        # A refused handshake is this helper's expected outcome, so keep the
+        # loop from printing a traceback for it.
+        loop.set_exception_handler(lambda _loop, _ctx: None)
+
+        async def handle(reader, writer):
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=ctx)
+        port = server.sockets[0].getsockname()[1]
+        client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client_ctx.check_hostname = False
+        client_ctx.verify_mode = ssl.CERT_NONE
+        client_ctx.minimum_version = version
+        client_ctx.maximum_version = version
+        # The client must also permit old suites, or we would only be measuring
+        # the client's own floor rather than the server's.
+        client_ctx.set_ciphers("ALL:@SECLEVEL=0")
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", port, ssl=client_ctx), 5
+            )
+            writer.close()
+            return True
+        except (ssl.SSLError, OSError, asyncio.TimeoutError):
+            return False
+        finally:
+            await asyncio.sleep(0)  # let the server see the close
+            server.close()
+            await server.wait_closed()
+            loop.set_exception_handler(previous_handler)
+
+    async def test_strict_server_rejects_tls1_0(self):
+        self.assertFalse(await self._handshake_version(False, ssl.TLSVersion.TLSv1))
+
+    async def test_legacy_server_accepts_tls1_0(self):
+        self.assertTrue(await self._handshake_version(True, ssl.TLSVersion.TLSv1))
+
+    async def test_both_accept_tls1_2(self):
+        self.assertTrue(await self._handshake_version(False, ssl.TLSVersion.TLSv1_2))
+        self.assertTrue(await self._handshake_version(True, ssl.TLSVersion.TLSv1_2))
+
     async def test_plaintext_client_against_tls_server_does_not_silently_succeed(self):
+
         """The classic mistake must surface a failure, not appear to work.
 
         A plaintext client pointed at a TLS port does not get an exception from

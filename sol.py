@@ -264,23 +264,46 @@ DEVICE_CIPHERS = (
 )
 
 
-def server_ssl_context(cert_file: str | Path, key_file: str | Path) -> ssl.SSLContext:
+def server_ssl_context(
+    cert_file: str | Path,
+    key_file: str | Path,
+    *,
+    allow_legacy_tls: bool = False,
+) -> ssl.SSLContext:
     """Build the TLS context a device expects from the cloud endpoint.
 
-    Ties protocol to TLS 1.2 with the device's cipher list, disables
-    verification (the certificate is self-signed), and permits older
-    unsigned-certificate handshakes that some firmware insists on.
+    Ties protocol to TLS 1.2 with the device's cipher list and disables
+    verification (the certificate is self-signed).
+
+    ``allow_legacy_tls`` also permits TLS 1.0/1.1.  Those are disabled by
+    default because 1.2 is what current firmware negotiates, but older bulbs
+    cap out lower and will otherwise abort the handshake with nothing but a
+    connection reset.  Opting in is a deliberate downgrade, so it is explicit.
     """
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=str(cert_file), keyfile=str(key_file))
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.maximum_version = ssl.TLSVersion.TLSv1_2
+    if allow_legacy_tls:
+        # Deprecated in OpenSSL 3, but the only way to talk to old firmware.
+        context.minimum_version = ssl.TLSVersion.TLSv1
+        context.maximum_version = ssl.TLSVersion.TLSv1_2
+        context.options &= ~ssl.OP_NO_TLSv1
+        context.options &= ~ssl.OP_NO_TLSv1_1
+    else:
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.maximum_version = ssl.TLSVersion.TLSv1_2
     try:
         context.set_ciphers(":".join(DEVICE_CIPHERS))
     except ssl.SSLError as exc:  # pragma: no cover - depends on OpenSSL build
         LOG.warning("could not set device cipher list (%s); using defaults", exc)
+    if allow_legacy_tls:
+        # Old firmware may offer only CBC suites, which modern OpenSSL refuses
+        # at the default security level.
+        try:
+            context.set_ciphers(":".join(DEVICE_CIPHERS) + ":@SECLEVEL=0")
+        except ssl.SSLError:  # pragma: no cover
+            pass
     return context
 
 
@@ -881,6 +904,7 @@ async def serve(
     tls: bool = False,
     cert_file: str | Path | None = None,
     key_file: str | Path | None = None,
+    allow_legacy_tls: bool = False,
 ) -> None:
     """Run the frame gateway until cancelled.
 
@@ -943,8 +967,14 @@ async def serve(
     if tls:
         if not cert_file or not key_file:
             raise ValueError("tls=True requires cert_file and key_file")
-        ssl_ctx = server_ssl_context(cert_file, key_file)
+        ssl_ctx = server_ssl_context(
+            cert_file, key_file, allow_legacy_tls=allow_legacy_tls
+        )
         LOG.info("TLS enabled with certificate %s", cert_file)
+        if allow_legacy_tls:
+            LOG.warning(
+                "legacy TLS (1.0/1.1) enabled -- only use this for old firmware"
+            )
 
     server = await asyncio.start_server(handle, host, port, ssl=ssl_ctx)
     addrs = ", ".join(str(s.getsockname()) for s in (server.sockets or []))
@@ -984,6 +1014,7 @@ async def _cmd_serve(args: argparse.Namespace) -> int:
             tls=args.tls,
             cert_file=args.cert,
             key_file=args.key,
+            allow_legacy_tls=args.legacy_tls,
         )
     except asyncio.CancelledError:
         pass
@@ -1095,6 +1126,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_serve.add_argument("--cert", default="certs/cert.pem", help="PEM certificate")
     p_serve.add_argument("--key", default="certs/key.pem", help="PEM private key")
+    p_serve.add_argument(
+        "--legacy-tls",
+        action="store_true",
+        help="also accept TLS 1.0/1.1 for old firmware (security downgrade)",
+    )
     p_serve.set_defaults(func=_cmd_serve)
 
     p_certs = sub.add_parser("certs", help="generate a self-signed cert for interception")

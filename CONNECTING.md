@@ -69,6 +69,19 @@ If you'd rather not deal with certificates yet, the gateway also runs in
 plaintext (`serve` without `--tls`) — useful for testing the framing logic
 locally, but a real lamp will not complete a handshake against it.
 
+### If the connection resets instantly
+
+The gateway pins **TLS 1.2** because that's what current firmware negotiates.
+Some older bulbs cap out at TLS 1.0/1.1 and will drop the connection with no
+error at all. Retry with the deliberate downgrade:
+
+```powershell
+python sol.py serve --tls --legacy-tls -v
+```
+
+It logs a warning when active. Only use it for old hardware — it lowers the
+security floor.
+
 ## 3. Point the lamp at your machine (DNS redirect)
 
 This is the one hard requirement. The lamp resolves a cloud hostname at boot and
@@ -153,6 +166,7 @@ the wire with a capture before relying on them.
 |---|---|
 | No connections at all | DNS redirect not applied, or lamp not power-cycled |
 | Connection, then `TLS failure during read` | Certificate rejected / cipher mismatch |
+| Connection resets instantly, zero bytes | Old firmware capping below TLS 1.2 — try `--legacy-tls` |
 | Connection, TLS fine, zero frames | Wrong port redirected, or different firmware protocol |
 | `address already in use` | An earlier run still holds 23779 |
 | Frames out, never `acknowledged` | Wrong `--device` id |
