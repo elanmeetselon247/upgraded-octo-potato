@@ -5,3 +5,7 @@ build/
 dist/
 .venv/
 repos/
+
+# Generated TLS material for lamp interception: the key is a secret.
+certs/
+*.pem

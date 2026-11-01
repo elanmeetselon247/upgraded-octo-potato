@@ -48,6 +48,12 @@ Where a field layout is inferred from documentation rather than proven from a
 capture -- notably the brightness, colour-temperature and RGB envelopes -- this
 module says so at the point of use and provides ``replay`` so a captured frame
 can be sent verbatim while the generated form is still being validated.
+
+TLS
+---
+Real devices speak TLS on 23779, not plaintext, so ``--tls`` is needed to talk
+to hardware; see ``CONNECTING.md`` for the network setup that goes with it.  The
+default plaintext mode remains useful for exercising the framing logic locally.
 """
 
 from __future__ import annotations
@@ -55,10 +61,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import ssl
 import struct
+import subprocess
 import sys
-from dataclasses import dataclass, field
-from typing import AsyncIterator, Callable, Iterable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Sequence
 
 __version__ = "1.0.0"
 
@@ -224,6 +233,92 @@ def parse_header(buf: bytes | bytearray) -> tuple[int, int, bool]:
             % (length, MAX_BODY)
         )
     return type_byte >> 4, length, bool(type_byte & 0x8)
+
+
+# ---------------------------------------------------------------------------
+# TLS
+# ---------------------------------------------------------------------------
+
+# Cync devices speak TLS on 23779, not plaintext.  The cloud certificate is for
+# this hostname, and a device pointed at a local server via DNS override will
+# present/accept a connection for it -- it does not verify the chain, which is
+# why a self-signed certificate works for interception.
+CLOUD_HOSTNAME = "cm.gelighting.com"
+
+# Cipher suites the device firmware offers (TLS 1.2).  Order matters: the device
+# and the cloud negotiate ECDHE-RSA-AES256-GCM-SHA384.  Plain AES and 3DES entries
+# are kept for older firmware that does not do ECDHE.
+DEVICE_CIPHERS = (
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-RSA-AES256-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "AES256-GCM-SHA384",
+    "AES128-GCM-SHA256",
+    "AES256-SHA256",
+    "AES128-SHA256",
+    "AES256-SHA",
+    "AES128-SHA",
+)
+
+
+def server_ssl_context(cert_file: str | Path, key_file: str | Path) -> ssl.SSLContext:
+    """Build the TLS context a device expects from the cloud endpoint.
+
+    Ties protocol to TLS 1.2 with the device's cipher list, disables
+    verification (the certificate is self-signed), and permits older
+    unsigned-certificate handshakes that some firmware insists on.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=str(cert_file), keyfile=str(key_file))
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.maximum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        context.set_ciphers(":".join(DEVICE_CIPHERS))
+    except ssl.SSLError as exc:  # pragma: no cover - depends on OpenSSL build
+        LOG.warning("could not set device cipher list (%s); using defaults", exc)
+    return context
+
+
+def client_ssl_context(verify: bool = False) -> ssl.SSLContext:
+    """Build the TLS context used when connecting *to* a device or the cloud."""
+    if verify:
+        return ssl.create_default_context()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def generate_self_signed_cert(
+    cert_file: str | Path,
+    key_file: str | Path,
+    common_name: str = CLOUD_HOSTNAME,
+    days: int = 3650,
+) -> None:
+    """Write a self-signed certificate/key pair for device interception.
+
+    Shells out to ``openssl`` because the standard library cannot mint
+    certificates.  The CN matches the cloud hostname the device expects.
+    """
+    cert_path, key_path = Path(cert_file), Path(key_file)
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key_path), "-out", str(cert_path),
+            "-subj", "/CN=%s" % common_name,
+            "-sha256", "-days", str(days),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -636,12 +731,25 @@ class SolClient(SolProtocol):
         self._reader_task: asyncio.Task | None = None
 
     async def connect(
-        self, host: str, port: int = DEFAULT_PORT, timeout: float = 5.0
+        self,
+        host: str,
+        port: int = DEFAULT_PORT,
+        timeout: float = 5.0,
+        *,
+        tls: bool = False,
     ) -> None:
-        """Open the TCP connection and start the read loop."""
-        LOG.info("connecting to %s:%d", host, port)
+        """Open the connection and start the read loop.
+
+        ``tls`` enables TLS with verification disabled -- that is what a Cync
+        device speaks on 23779, so talking to real hardware requires it.
+        """
+        LOG.info("connecting to %s:%d%s", host, port, " (TLS)" if tls else "")
+        ssl_ctx = client_ssl_context() if tls else None
         self.reader, self.writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
+            asyncio.open_connection(
+                host, port, ssl=ssl_ctx, server_hostname=CLOUD_HOSTNAME if tls else None
+            ),
+            timeout=timeout,
         )
         LOG.info("connected to %s:%d", host, port)
         self._reader_task = asyncio.create_task(self._read_loop())
@@ -711,6 +819,7 @@ async def client_with_retry(
     *,
     retries: int = 3,
     ack_timeout: float = 2.0,
+    tls: bool = False,
 ) -> int:
     """Connect, send the commands ``build`` returns, and wait for acks.
 
@@ -720,7 +829,7 @@ async def client_with_retry(
     for attempt in range(1, retries + 1):
         client = SolClient()
         try:
-            await client.connect(host, port)
+            await client.connect(host, port, tls=tls)
             for command in build(client):
                 frame = command.to_frame()
                 msg_id = command.msg_id
@@ -736,12 +845,24 @@ async def client_with_retry(
             return 0
         except (OSError, asyncio.TimeoutError) as exc:
             last_error = exc
-            LOG.warning("attempt %d/%d failed: %s", attempt, retries, exc)
+            # ssl.SSLError often stringifies to "" when raised inside the
+            # handshake, which makes the log useless exactly when it matters.
+            detail = str(exc) or type(exc).__name__
+            if isinstance(exc, ssl.SSLError):
+                detail = "%s (TLS handshake failed; check that the peer speaks " \
+                         "TLS on this port and accepts the certificate)" % (
+                             str(exc) or "SSLError"
+                         )
+            LOG.warning("attempt %d/%d failed: %s", attempt, retries, detail)
             if attempt < retries:
                 await asyncio.sleep(min(2 ** (attempt - 1), 5))
         finally:
             await client.close()
-    LOG.error("giving up after %d attempts: %s", retries, last_error)
+    LOG.error(
+        "giving up after %d attempts: %s",
+        retries,
+        (str(last_error) or type(last_error).__name__) if last_error else "unknown",
+    )
     return 1
 
 
@@ -757,6 +878,9 @@ async def serve(
     ready: asyncio.Event | None = None,
     on_frame: Callable[[Frame], None] | None = None,
     on_bound: Callable[[int], None] | None = None,
+    tls: bool = False,
+    cert_file: str | Path | None = None,
+    key_file: str | Path | None = None,
 ) -> None:
     """Run the frame gateway until cancelled.
 
@@ -769,7 +893,11 @@ async def serve(
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         name = "%s:%s" % peer[:2] if peer else "conn"
-        LOG.info("+ connection from %s", name)
+        cipher = writer.get_extra_info("cipher")
+        if cipher:
+            LOG.info("+ connection from %s (TLS %s)", name, cipher[0])
+        else:
+            LOG.info("+ connection from %s%s", name, "" if ssl_ctx else " (plaintext)")
         conn = SolServerConnection(reader, writer, name=name)
         conn.on_frame = on_frame
         connections.add(conn)
@@ -777,6 +905,16 @@ async def serve(
             while True:
                 try:
                     data = await reader.read(4096)
+                except ssl.SSLError as exc:
+                    # A device that rejects the certificate lands here; say so
+                    # clearly, because the generic message is unhelpful.
+                    LOG.error(
+                        "%s: TLS failure during read (%s) -- the device may be "
+                        "rejecting the certificate or cipher list",
+                        name,
+                        exc,
+                    )
+                    break
                 except (ConnectionError, OSError) as exc:
                     LOG.warning("%s: read error: %s", name, exc)
                     break
@@ -801,7 +939,14 @@ async def serve(
                 len(conn.buffer),
             )
 
-    server = await asyncio.start_server(handle, host, port)
+    ssl_ctx = None
+    if tls:
+        if not cert_file or not key_file:
+            raise ValueError("tls=True requires cert_file and key_file")
+        ssl_ctx = server_ssl_context(cert_file, key_file)
+        LOG.info("TLS enabled with certificate %s", cert_file)
+
+    server = await asyncio.start_server(handle, host, port, ssl=ssl_ctx)
     addrs = ", ".join(str(s.getsockname()) for s in (server.sockets or []))
     LOG.info("listening on %s", addrs)
     if on_bound is not None and server.sockets:
@@ -833,12 +978,33 @@ def _configure_logging(verbose: bool) -> None:
 
 async def _cmd_serve(args: argparse.Namespace) -> int:
     try:
-        await serve(args.host, args.port)
+        await serve(
+            args.host,
+            args.port,
+            tls=args.tls,
+            cert_file=args.cert,
+            key_file=args.key,
+        )
     except asyncio.CancelledError:
         pass
     except OSError as exc:
         LOG.error("cannot listen on %s:%d: %s", args.host, args.port, exc)
         return 1
+    return 0
+
+
+async def _cmd_certs(args: argparse.Namespace) -> int:
+    """Generate the self-signed certificate a device will accept."""
+    try:
+        generate_self_signed_cert(args.cert, args.key, common_name=args.cn)
+    except FileNotFoundError:
+        LOG.error("openssl is required to generate certificates but was not found")
+        return 1
+    except subprocess.CalledProcessError as exc:
+        LOG.error("openssl failed: %s", exc)
+        return 1
+    LOG.info("wrote certificate %s and key %s (CN=%s)", args.cert, args.key, args.cn)
+    print("now run: python sol.py serve --tls --cert %s --key %s" % (args.cert, args.key))
     return 0
 
 
@@ -874,7 +1040,12 @@ async def _cmd_send(args: argparse.Namespace) -> int:
         return commands
 
     return await client_with_retry(
-        args.host, args.port, build, retries=args.retries, ack_timeout=args.timeout
+        args.host,
+        args.port,
+        build,
+        retries=args.retries,
+        ack_timeout=args.timeout,
+        tls=args.tls,
     )
 
 
@@ -895,7 +1066,7 @@ async def _cmd_replay(args: argparse.Namespace) -> int:
     raw = bytes.fromhex(args.hex) if args.hex else sys.stdin.buffer.read()
     client = SolClient()
     try:
-        await client.connect(args.host, args.port)
+        await client.connect(args.host, args.port, tls=args.tls)
         await client.send_bytes(raw)
         await asyncio.sleep(args.timeout)
         return 0
@@ -917,7 +1088,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve = sub.add_parser("serve", help="run the TCP gateway (default :23779)")
     p_serve.add_argument("--host", default=DEFAULT_HOST)
     p_serve.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p_serve.add_argument(
+        "--tls",
+        action="store_true",
+        help="serve TLS, as real devices expect (needs --cert and --key)",
+    )
+    p_serve.add_argument("--cert", default="certs/cert.pem", help="PEM certificate")
+    p_serve.add_argument("--key", default="certs/key.pem", help="PEM private key")
     p_serve.set_defaults(func=_cmd_serve)
+
+    p_certs = sub.add_parser("certs", help="generate a self-signed cert for interception")
+    p_certs.add_argument("--cert", default="certs/cert.pem")
+    p_certs.add_argument("--key", default="certs/key.pem")
+    p_certs.add_argument("--cn", default=CLOUD_HOSTNAME, help="certificate CN")
+    p_certs.set_defaults(func=_cmd_certs)
 
     p_send = sub.add_parser("send", help="send control commands to a lamp/gateway")
     p_send.add_argument("host")
@@ -927,6 +1111,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="on, off, status, brightness=N, temperature=N, rgb=R,G,B",
     )
     p_send.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p_send.add_argument(
+        "--tls", action="store_true", help="connect over TLS (required by real devices)"
+    )
     p_send.add_argument(
         "--device",
         type=lambda s: int(s, 0),
@@ -950,6 +1137,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_replay.add_argument("host")
     p_replay.add_argument("--hex", help="raw frame bytes as hex")
     p_replay.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p_replay.add_argument(
+        "--tls", action="store_true", help="connect over TLS (required by real devices)"
+    )
     p_replay.add_argument("--timeout", type=float, default=1.0)
     p_replay.set_defaults(func=_cmd_replay)
 

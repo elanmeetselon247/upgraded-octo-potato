@@ -8,8 +8,12 @@ the parser must read them back without loss.
 from __future__ import annotations
 
 import asyncio
+import ssl
 import struct
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
 import sol
 
@@ -448,6 +452,121 @@ class TestSocketRoundTrip(unittest.IsolatedAsyncioTestCase):
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+
+
+class TestTls(unittest.TestCase):
+    """TLS is required by real devices, so the context setup must be right."""
+
+    def test_device_ciphers_include_the_negotiated_suite(self):
+        # Captured hardware negotiation: ECDHE-RSA-AES256-GCM-SHA384.
+        self.assertEqual(sol.DEVICE_CIPHERS[0], "ECDHE-RSA-AES256-GCM-SHA384")
+
+    def test_cloud_hostname_matches_certificate_cn(self):
+        self.assertEqual(sol.CLOUD_HOSTNAME, "cm.gelighting.com")
+
+    def test_client_context_does_not_verify_by_default(self):
+        # Devices present self-signed certificates via DNS interception.
+        ctx = sol.client_ssl_context()
+        self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)
+        self.assertFalse(ctx.check_hostname)
+
+    def test_generate_and_load_certificate(self):
+        """A generated cert must load into a server context with the right CN."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cert = Path(tmp) / "cert.pem"
+            key = Path(tmp) / "key.pem"
+            try:
+                sol.generate_self_signed_cert(cert, key)
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                self.skipTest("openssl not available")
+            self.assertTrue(cert.exists() and key.exists())
+            ctx = sol.server_ssl_context(cert, key)
+            self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)
+            self.assertEqual(ctx.minimum_version, ssl.TLSVersion.TLSv1_2)
+            self.assertEqual(ctx.maximum_version, ssl.TLSVersion.TLSv1_2)
+
+
+class TestTlsSocketRoundTrip(unittest.IsolatedAsyncioTestCase):
+    """Full encrypted round trip: the shape a real device connection takes."""
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cert = Path(self.tmp.name) / "cert.pem"
+        self.key = Path(self.tmp.name) / "key.pem"
+        try:
+            sol.generate_self_signed_cert(self.cert, self.key)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            self.tmp.cleanup()
+            self.skipTest("openssl not available")
+
+    async def asyncTearDown(self):
+        self.tmp.cleanup()
+
+    async def test_control_frame_over_tls_gets_ack(self):
+        ctx = sol.server_ssl_context(self.cert, self.key)
+        received: list[sol.Frame] = []
+
+        async def handle(reader, writer):
+            conn = sol.SolServerConnection(reader, writer, name="tls")
+            conn.on_frame = received.append
+            while True:
+                data = await reader.read(4096)
+                if not data:
+                    break
+                await conn.on_data(data)
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=ctx)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            client = sol.SolClient()
+            await client.connect("127.0.0.1", port, tls=True)
+            try:
+                with self.assertLogs("sol", level="INFO"):
+                    await client.send_frame(
+                        sol.build_power(DEVICE_ID, MSG_ON, SEQ_ON, True).to_frame()
+                    )
+                    acked = await client.wait_for_ack(MSG_ON, timeout=5.0)
+                self.assertTrue(acked, "expected an ack over TLS")
+            finally:
+                await client.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+        self.assertEqual(len(received), 1)
+        mesh = received[0].mesh()
+        self.assertEqual(mesh.op_code, sol.OP_SET_POWER)
+        self.assertTrue(mesh.checksum_valid)
+
+    async def test_plaintext_client_against_tls_server_does_not_silently_succeed(self):
+        """The classic mistake must surface a failure, not appear to work.
+
+        A plaintext client pointed at a TLS port does not get an exception from
+        connect(): it blocks waiting for a ServerHello it cannot parse, so the
+        connection times out on the first read instead.  Either way the caller
+        must see an error rather than a phantom success.
+        """
+        ctx = sol.server_ssl_context(self.cert, self.key)
+
+        async def handle(reader, writer):
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=ctx)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            try:
+                with self.assertRaises(
+                    (OSError, ssl.SSLError, asyncio.TimeoutError, ConnectionError)
+                ):
+                    # No data can arrive: the peer is waiting for a handshake.
+                    await asyncio.wait_for(reader.read(16), timeout=1.5)
+            finally:
+                writer.close()
+        finally:
+            server.close()
+            await server.wait_closed()
 
 
 class TestCli(unittest.TestCase):
