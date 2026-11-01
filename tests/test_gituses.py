@@ -249,7 +249,56 @@ class ServerTests(BaseServerCase):
         status, _, _ = self.http("/..%2F..%2Fetc/passwd", token=self.token)
         self.assertIn(status, (400, 404))
 
-    def test_clone_push_clone_roundtrip(self):
+    def test_path_traversal_is_not_a_server_error(self):
+        # git-http-backend answers "aliased" paths with Status: 500 and no
+        # body; the server must reject them itself so a probe cannot be
+        # mistaken for a crash, and so no file outside the store is reachable.
+        for path in (
+            "/demo.git/../../../etc/passwd",
+            "/demo.git/..%2f..%2fgituses.json",
+            "/demo.git/%2e%2e/%2e%2e/evil",
+            "/demo.git/sub/../info/refs",
+        ):
+            for method in ("GET", "HEAD", "POST"):
+                status, _, body = self.http(path, method=method, token=self.token)
+                self.assertEqual(status, 404, "%s %s" % (method, path))
+                self.assertNotIn(b"root:", body)
+
+    def test_user_content_is_never_served(self):
+        # The store config holds the token; it must never leak through the
+        # repository paths git itself allows.
+        status, _, body = self.http("/demo.git/info/refs", token=self.token)
+        self.assertIn(status, (200, 404))
+        self.assertNotIn(self.token.encode(), body)
+        status, _, body = self.http("/demo.git", token=self.token)
+        self.assertNotIn(self.token.encode(), body)
+
+    def test_options_and_method_errors(self):
+        # Browsers preflight; without do_OPTIONS the stdlib answers 501.
+        status, headers, body = self.http("/demo.git/info/refs", method="OPTIONS")
+        self.assertEqual(status, 204)
+        self.assertEqual(body, b"")
+        self.assertIn("POST", headers["Allow"])
+        self.assertIn("OPTIONS", headers["Allow"])
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "*")
+
+        status, headers, body = self.http("/", method="OPTIONS")
+        self.assertEqual(status, 204)
+        self.assertIn("GET", headers["Allow"])
+
+        # Verbs git never sends get a plain 405 with an Allow header, not the
+        # stdlib's HTML 501.
+        for method, path in (
+            ("PUT", "/demo.git/info/refs"),
+            ("DELETE", "/demo.git/info/refs"),
+            ("PATCH", "/demo.git/HEAD"),
+            ("POST", "/_health"),
+        ):
+            status, headers, body = self.http(path, method=method, token=self.token)
+            self.assertEqual(status, 405, "%s %s" % (method, path))
+            self.assertIn("Allow", headers)
+            self.assertEqual(body, b"method not allowed\n")
+
         work = self.make_work_repo()
         first = self.commit_file(work, "README.md", "hello gituses\n", "initial commit")
         self.commit_file(work, "src/app.py", "print('hi')\n", "add app")

@@ -95,6 +95,16 @@ commands.
 `GET /<repo>.git` also supports git's dumb-HTTP fallback because
 `git-http-backend` handles it.
 
+`OPTIONS` answers CORS preflight with `204` and an `Allow` header, so
+browser-based tooling can talk to the server. Any verb git never uses (`PUT`,
+`DELETE`, `PATCH`) gets a plain `405` with `Allow` set, rather than the stdlib's
+HTML `501`.
+
+Paths containing a `..` segment are rejected with `404` before
+`git-http-backend` sees them. Git itself refuses such paths ("aliased") but
+reports the refusal as `Status: 500` with an empty body, which would turn a
+harmless probe into what looks like a crash.
+
 ## How it works
 
 ```
@@ -124,10 +134,12 @@ git client  ──HTTP──▶  GitusesHandler (threaded)  ──CGI──▶  
 
 The suite drives real `git` clients against a live server: clone, push, force
 push, branch pushes, 4 MiB chunked pushes, 25 repositories, eight concurrent
-clones, authentication failures, path traversal attempts and deletion.
+clones, authentication failures, path traversal attempts, `OPTIONS` preflight,
+`405` method handling and deletion.
 
 ```sh
 python3 -m unittest discover -s tests -t . -v
+```
 
 ## Run it as a service
 
@@ -168,5 +180,3 @@ server.serve_forever()
 ## License
 
 Released into the public domain under the [Unlicense](LICENSE).
-
-```
