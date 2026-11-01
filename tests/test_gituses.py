@@ -249,6 +249,37 @@ class ServerTests(BaseServerCase):
         status, _, _ = self.http("/..%2F..%2Fetc/passwd", token=self.token)
         self.assertIn(status, (400, 404))
 
+    def test_traversal_inside_repository_is_not_an_internal_error(self):
+        status, _, _ = self.http(
+            "/demo.git/../demo.git/info/refs?service=git-upload-pack",
+            token=self.token,
+        )
+        self.assertEqual(status, 404)
+
+    def test_unused_verbs_answer_405_with_allow_header(self):
+        for method in ("PUT", "DELETE", "PATCH"):
+            status, headers, _ = self.http(
+                "/demo.git/info/refs?service=git-upload-pack",
+                method=method,
+                token=self.token,
+            )
+            self.assertEqual(status, 405, method)
+            self.assertIn("GET", headers["Allow"])
+            self.assertIn("POST", headers["Allow"])
+
+    def test_unused_verbs_on_health_are_rejected(self):
+        status, headers, _ = self.http("/_health", method="DELETE")
+        self.assertEqual(status, 405)
+        self.assertIn("OPTIONS", headers["Allow"])
+
+    def test_options_advertises_methods_for_cors(self):
+        status, headers, _ = self.http("/demo.git/info/refs", method="OPTIONS")
+        self.assertEqual(status, 204)
+        self.assertIn("GET", headers["Allow"])
+        self.assertIn("POST", headers["Allow"])
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "*")
+        self.assertIn("Git-Protocol", headers["Access-Control-Allow-Headers"])
+
     def test_clone_push_clone_roundtrip(self):
         work = self.make_work_repo()
         first = self.commit_file(work, "README.md", "hello gituses\n", "initial commit")

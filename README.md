@@ -32,6 +32,16 @@ roughly 16 GiB of git history.
 Requires Python 3.10+ and git (with `git-http-backend`, included in the normal
 git packages).
 
+On Windows the equivalent of the package manager line is:
+
+```powershell
+winget install --id Git.Git -e --source winget
+```
+
+`gituses` looks for `git-http-backend.exe` next to the rest of git's helper
+programs, so the standard Git for Windows install needs no extra configuration.
+Everything else (paths, `python -m gituses`, tokens) works the same way.
+
 ```sh
 # 1. create a store (prints an access token; keep it)
 python3 -m gituses init --root ~/gituses
@@ -128,6 +138,7 @@ clones, authentication failures, path traversal attempts and deletion.
 
 ```sh
 python3 -m unittest discover -s tests -t . -v
+```
 
 ## Run it as a service
 
