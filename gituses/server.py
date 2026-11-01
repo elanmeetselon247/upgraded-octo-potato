@@ -27,6 +27,7 @@ from .repo import GitusesError, Store, validate_name
 
 CHUNK = 64 * 1024
 REALM = "gituses"
+ALLOWED_METHODS = "GET, HEAD, POST, OPTIONS"
 
 _GIT_BACKEND = None
 _GIT_BACKEND_LOCK = threading.Lock()
@@ -83,15 +84,50 @@ class GitusesHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self._dispatch()
 
+    # Verbs git never uses. Answering them with 405 plus an Allow header is
+    # more useful (and less alarming in logs) than the stdlib's bare 501.
+    def do_PUT(self):
+        self._method_not_allowed()
+
+    def do_DELETE(self):
+        self._method_not_allowed()
+
+    def do_PATCH(self):
+        self._method_not_allowed()
+
+    def _method_not_allowed(self):
+        self._plain(405, "method not allowed\n", allow=ALLOWED_METHODS)
+
+    def do_OPTIONS(self):
+        """Answer CORS preflight and advertise the allowed methods.
+
+        git clients never send OPTIONS, but browser-based tooling and
+        dashboards do; without this the stdlib would answer 501.
+        """
+        self.send_response(204)
+        self.send_header("Allow", ALLOWED_METHODS)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", ALLOWED_METHODS)
+        self.send_header(
+            "Access-Control-Allow-Headers", "Authorization, Content-Type, Git-Protocol"
+        )
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
     def _dispatch(self):
         parsed = urlsplit(self.path)
         path = unquote(parsed.path)
         try:
             if path in ("/", "/index.html"):
                 if self.command not in ("GET", "HEAD"):
-                    return self._plain(405, "method not allowed\n")
+                    return self._plain(405, "method not allowed\n", allow=ALLOWED_METHODS)
                 return self._index()
             if path == "/_health":
+                if self.command not in ("GET", "HEAD"):
+                    return self._plain(405, "method not allowed\n", allow=ALLOWED_METHODS)
                 body = json.dumps(
                     {
                         "status": "ok",
@@ -107,6 +143,11 @@ class GitusesHandler(BaseHTTPRequestHandler):
                 validate_name(head)
                 repo = self.server.store.repo_path(head)
             except GitusesError:
+                return self._plain(404, "not found\n")
+            if path.count("/.."):
+                # Reject traversal instead of letting git-http-backend answer:
+                # it reports "aliased" paths as Status: 500 with no body, which
+                # turns a harmless probe into an empty internal error.
                 return self._plain(404, "not found\n")
             if not self._authorised():
                 return
@@ -383,12 +424,15 @@ concurrency limits.</p>
         )
         self._plain(200, body.encode("utf-8"), "text/html; charset=utf-8")
 
-    def _plain(self, status: int, body, content_type="text/plain; charset=utf-8"):
+    def _plain(self, status: int, body, content_type="text/plain; charset=utf-8",
+               allow=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if allow:
+            self.send_header("Allow", allow)
         self.send_header("Connection", "close")
         self.end_headers()
         if self.command != "HEAD":
