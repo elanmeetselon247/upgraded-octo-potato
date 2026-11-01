@@ -415,7 +415,41 @@ class AnonymousServerTests(BaseServerCase):
         self.assertTrue(json.loads(body)["anonymous"])
 
 
+class BackendLookupTests(unittest.TestCase):
+    """git_http_backend must find the helper on Linux and on Windows."""
+
+    def setUp(self):
+        # The module caches the resolved path; reset it so each test starts
+        # from a clean state.
+        import gituses.server as server_module
+
+        self.server_module = server_module
+        self.addCleanup(setattr, server_module, "_GIT_BACKEND", None)
+        self.addCleanup(os.environ.pop, "GIT_HTTP_BACKEND", None)
+
+    def test_resolves_on_this_platform(self):
+        self.server_module._GIT_BACKEND = None
+        path = self.server_module.git_http_backend()
+        self.assertTrue(os.path.isfile(path), path)
+
+    def test_env_override_wins(self):
+        os.environ["GIT_HTTP_BACKEND"] = "/custom/backend"
+        self.assertEqual(self.server_module.git_http_backend(), "/custom/backend")
+
+    def test_windows_suffix_is_considered(self):
+        # git for Windows ships git-http-backend.exe; the lookup must include
+        # the .exe form or the server cannot start there.
+        import inspect
+
+        source = inspect.getsource(self.server_module.git_http_backend)
+        self.assertIn("git-http-backend.exe", source)
+        # os.access(..., X_OK) is meaningless on Windows, so it must not be the
+        # only gate.
+        self.assertIn('os.name == "nt"', source)
+
+
 if __name__ == "__main__":
+
     unittest.main()
 
 

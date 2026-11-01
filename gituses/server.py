@@ -53,11 +53,17 @@ def git_http_backend() -> str:
                 raise RuntimeError("git is required but was not found on PATH") from exc
             candidates = [
                 os.path.join(exec_path, "git-http-backend"),
+                # git for Windows ships the executable with a .exe suffix.
+                os.path.join(exec_path, "git-http-backend.exe"),
                 "/usr/lib/git-core/git-http-backend",
                 "/usr/libexec/git-core/git-http-backend",
             ]
             for candidate in candidates:
-                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                # os.access(..., X_OK) is unreliable on Windows, where the
+                # execute bit is not meaningful; the executable suffix decides.
+                if os.path.isfile(candidate) and (
+                    os.name == "nt" or os.access(candidate, os.X_OK)
+                ):
                     _GIT_BACKEND = candidate
                     break
             else:  # pragma: no cover - depends on the git package
