@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -14,7 +15,13 @@ import unittest
 import urllib.error
 import urllib.request
 
-from gituses.repo import GitusesError, Store, validate_name
+from gituses.repo import (
+    UNLIMITED_REPO_CONFIG,
+    GitusesError,
+    Store,
+    apply_unlimited_config,
+    validate_name,
+)
 from gituses.server import GitusesServer
 
 TOKEN = "test-token-123"
@@ -100,6 +107,90 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(os.path.exists(self.store.config_path))
         self.assertEqual(self.store.token(), "")
         self.assertEqual([r["name"] for r in self.store.list()], ["orphan"])
+
+
+class UnlimitedTests(unittest.TestCase):
+    """The README promises no limits; these tests keep that promise honest."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="gituses-unlimited-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.store = Store(self.root)
+        self.store.init(token=TOKEN)
+
+    def repo_config(self, name, key):
+        return git("config", key, cwd=self.store.repo_path(name), check=False).stdout.strip()
+
+    def test_new_repository_has_no_caps(self):
+        path = self.store.create("demo")
+        for key, value in UNLIMITED_REPO_CONFIG.items():
+            self.assertEqual(
+                self.repo_config("demo", key),
+                value,
+                "%s should be %r in a new repository (%s)" % (key, value, path),
+            )
+
+    def test_push_over_http_is_enabled(self):
+        # Without http.receivepack git-http-backend refuses to receive packs.
+        self.store.create("demo")
+        self.assertEqual(self.repo_config("demo", "http.receivepack"), "true")
+
+    def test_existing_repository_caps_are_removed(self):
+        # A repo created elsewhere (or by an older gituses, or by a hosting
+        # provider's templates) with provider-style caps must lose them.
+        path = self.store.create("legacy")
+        for key, cap in (
+            ("receive.maxInputSize", "100"),
+            ("receive.unpackLimit", "1"),
+            ("receive.denyDeletes", "true"),
+            ("receive.denyNonFastForwards", "true"),
+            ("http.receivepack", "false"),
+        ):
+            git("config", key, cap, cwd=path)
+        # ``gituses serve`` re-asserts the policy on every start, and reports
+        # how many repositories it repaired.
+        self.assertEqual(self.store.apply_unlimited_policy(), 1)
+        for key, value in UNLIMITED_REPO_CONFIG.items():
+            self.assertEqual(self.repo_config("legacy", key), value, key)
+        # A compliant store is left untouched and reports nothing to repair.
+        self.assertEqual(self.store.apply_unlimited_policy(), 0)
+
+    def test_unrelated_repository_settings_survive_the_policy(self):
+        path = self.store.create("legacy")
+        git("config", "core.logallrefupdates", "true", cwd=path)
+        git("config", "myapp.setting", "keep-me", cwd=path)
+        git("config", "receive.maxInputSize", "100", cwd=path)
+        self.store.apply_unlimited_policy()
+        self.assertEqual(self.repo_config("legacy", "core.logallrefupdates"), "true")
+        self.assertEqual(self.repo_config("legacy", "myapp.setting"), "keep-me")
+        self.assertEqual(self.repo_config("legacy", "receive.maxInputSize"), "0")
+
+    def test_policy_application_is_idempotent(self):
+        path = self.store.create("demo")
+        with open(os.path.join(path, "config"), encoding="utf-8") as handle:
+            before = handle.read()
+        for _ in range(3):
+            apply_unlimited_config(path)
+        with open(os.path.join(path, "config"), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_server_backlog_is_not_small(self):
+        # socketserver defaults to 5, which turns a burst of clones into
+        # ECONNREFUSED; the README promises no cap on concurrent clients.
+        self.assertGreaterEqual(GitusesServer.request_queue_size, 1024)
+
+    def test_real_socket_uses_the_larger_backlog(self):
+        server = GitusesServer(("127.0.0.1", 0), self.store, token=TOKEN)
+        self.addCleanup(server.server_close)
+        # A TCP socket is listening only after listen(); a successful connect
+        # before the accept loop runs proves the backlog took the connections.
+        backlog = server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+        self.assertEqual(backlog, 1)
+        connections = []
+        self.addCleanup(lambda: [c.close() for c in connections])
+        for _ in range(50):
+            conn = socket.create_connection(server.server_address, timeout=5)
+            connections.append(conn)
 
 
 class BaseServerCase(unittest.TestCase):
@@ -340,6 +431,32 @@ class ServerTests(BaseServerCase):
             "/demo.git/info/refs?service=git-upload-pack", token=self.token
         )
         self.assertEqual(status, 404)
+
+
+    def test_branch_deletion_and_force_push_are_allowed(self):
+        # receive.denyDeletes / receive.denyNonFastForwards exist to block
+        # these; gituses must permit them.
+        work = self.make_work_repo("history")
+        first = self.commit_file(work, "a.txt", "one\n", "one")
+        git("push", "-q", self.url(), "main", cwd=work)
+        git("push", "-q", self.url(), "main:feature", cwd=work)
+
+        self.commit_file(work, "a.txt", "two\n", "two")
+        git("commit", "-q", "--amend", "-m", "rewritten", cwd=work)
+        git("push", "-q", "--force", self.url(), "main", cwd=work)
+        rewritten = git("rev-parse", "HEAD", cwd=work).stdout.strip()
+        self.assertNotEqual(rewritten, first)
+        self.assertIn(rewritten, self.ls_remote(self.url()))
+
+        git("push", "-q", self.url(), "--delete", "feature", cwd=work)
+        self.assertNotIn("refs/heads/feature", self.ls_remote(self.url()))
+
+    def test_unsupported_http_method_is_405(self):
+        # Previously http.server answered these with a bare 501.
+        for method in ("PUT", "DELETE", "PATCH", "OPTIONS"):
+            status, _, body = self.http("/demo.git/info/refs", method=method)
+            self.assertEqual(status, 405, method)
+            self.assertIn(b"not allowed", body)
 
 
 class AnonymousServerTests(BaseServerCase):

@@ -19,13 +19,39 @@ one small Python package plus the `git` binary you already have.
 | ------------------------------------ | ---------------------------------------- |
 | Repository count caps                | none — one bare repo per directory       |
 | Repo size caps / LFS paywalls        | none — git-http-backend streams to disk   |
-| Push size limits                     | none — chunked pushes spool to a temp file |
+| Push size limits                     | none — `receive.maxInputSize=0`           |
+| Object-count push limits             | none — `receive.unpackLimit=0`            |
+| Force-push / branch-deletion blocks  | none — `receive.deny*` disabled           |
 | Requests-per-hour / API rate limits  | none                                      |
-| Concurrent clone/push caps           | none — one thread per connection         |
+| Concurrent clone/push caps           | none — one thread per connection, backlog = `SOMAXCONN` |
 | Per-seat pricing                     | none — one shared token (or anonymous)   |
 
 The only limits are your disk, CPU and network. On a 16 GiB disk you can host
 roughly 16 GiB of git history.
+
+Every repository gituses tracks carries the same policy, defined once in
+`gituses/repo.py` as `UNLIMITED_REPO_CONFIG`:
+
+```ini
+[http]
+	receivepack = true                  # accept pushes over HTTP
+[receive]
+	maxInputSize = 0                    # 0 = no push size limit
+	unpackLimit = 0                     # 0 = never unpack into loose objects
+	denyDeletes = false                 # allow ref deletion
+	denyNonFastForwards = false         # allow force pushes / rewrites
+	keepAlive = 0                       # no keepalive packets mid-transfer
+[uploadpack]
+	allowFilter = true                  # partial clones (--filter)
+	allowAnySHA1InWant = true           # fetch any object by id
+```
+
+`gituses create` writes it for new repositories, and `gituses serve` (which runs
+the same check at startup) re-asserts it for repositories that already exist —
+so a repo created by an older gituses, or one that arrived with provider-style
+caps, loses those caps instead of having to be recreated. Re-applying it is a
+no-op, so it is safe on every start. From git's `receive.maxInputSize` docs:
+*"If not set or set to 0, then the size is unlimited."*
 
 ## Quick start
 
@@ -114,17 +140,24 @@ git client  ──HTTP──▶  GitusesHandler (threaded)  ──CGI──▶  
   1 MiB by default) are decoded to an unlinked temporary file first, because
   `git-http-backend` insists on an exact `CONTENT_LENGTH`; the file is removed
   as soon as the push finishes.
-* Repositories are created with `http.receivepack=true`,
-  `uploadpack.allowFilter=true` and `uploadpack.allowAnySHA1InWant=true`, so
-  partial clones, force pushes, branch deletion and history rewrites all work.
+* Repositories are created with the full `UNLIMITED_REPO_CONFIG` policy (see
+  above), so partial clones, force pushes, branch deletion, history rewrites
+  and pushes of any size all work. The policy is re-asserted for existing
+  repositories on every `serve`, so it also applies to repos that predate it.
+* The HTTP server accepts connections with a backlog of `SOMAXCONN` instead of
+  Python's default of 5, so a burst of clones never turns into `ECONNREFUSED`.
+  Socket buffers are left to the kernel's TCP autotuning on purpose: pinning a
+  huge `SO_SNDBUF` disables autotuning and makes long-haul clones slower.
 * All paths are validated against a single safe name component, so requests can
   never escape the store root.
 
 ## Tests
 
 The suite drives real `git` clients against a live server: clone, push, force
-push, branch pushes, 4 MiB chunked pushes, 25 repositories, eight concurrent
-clones, authentication failures, path traversal attempts and deletion.
+push, branch deletion, branch pushes, 4 MiB chunked pushes, 25 repositories,
+eight concurrent clones, authentication failures, path traversal attempts,
+deletion, and assertions that the unlimited policy is actually in force (for
+new and pre-existing repositories, and for the server's accept backlog).
 
 ```sh
 python3 -m unittest discover -s tests -t . -v

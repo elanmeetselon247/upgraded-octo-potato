@@ -96,6 +96,10 @@ def cmd_token(args) -> int:
 def cmd_serve(args) -> int:
     store = _store(args)
     store.require_initialised()
+    # Re-assert the unlimited policy on every start: repositories created by an
+    # older gituses, imported from elsewhere, or edited by hand get their caps
+    # removed instead of quietly throttling pushes.
+    repaired = store.apply_unlimited_policy()
     token = args.token if args.token is not None else store.token()
     try:
         server = make_server(store, host=args.host, port=args.port, token=token)
@@ -107,6 +111,8 @@ def cmd_serve(args) -> int:
     # A wildcard bind is not a usable URL; show something clickable instead.
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     print("gituses %s serving %d repositories" % (__version__, len(store.list())))
+    if repaired:
+        print("removed artificial limits from %d repositories" % repaired)
     print("root:  %s" % store.root)
     print("url:   http://%s:%d/" % (display_host, port))
     print("auth:  %s" % ("token required" if token else "anonymous"))

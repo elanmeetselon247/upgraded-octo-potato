@@ -16,6 +16,32 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
 CONFIG_NAME = "gituses.json"
 
+# Everything git would otherwise cap on a push or a fetch, switched off.  These
+# are applied to every repository gituses tracks (including ones that already
+# existed), so the "unlimited" promise is enforced by git itself and not just
+# by our own plumbing.  Each value is the one git's documentation defines as
+# "no limit"; see the comments for the reason each key is here.
+UNLIMITED_REPO_CONFIG = {
+    # Accept pushes over HTTP (opt-in in git-http-backend).
+    "http.receivepack": "true",
+    # Pack streams of any size: "If not set or set to 0, then the size is
+    # unlimited." (Documentation/config/receive.txt). Hosting providers use
+    # this key for push-size caps; we set it to 0 instead.
+    "receive.maxInputSize": "0",
+    # Always keep an incoming push as a pack instead of exploding it into one
+    # loose object file per object. 0 disables the unpack heuristic entirely,
+    # which is what makes pushes with millions of objects fast and predictable.
+    "receive.unpackLimit": "0",
+    # Allow force pushes, history rewrites and branch/tag deletion.
+    "receive.denyDeletes": "false",
+    "receive.denyNonFastForwards": "false",
+    # Do not inject keepalive packets while a large pack is being written.
+    "receive.keepAlive": "0",
+    # Partial clones (--filter=blob:none) and arbitrary object fetches.
+    "uploadpack.allowFilter": "true",
+    "uploadpack.allowAnySHA1InWant": "true",
+}
+
 
 class GitusesError(RuntimeError):
     """Raised for user facing errors (bad name, missing store, git failure)."""
@@ -64,6 +90,131 @@ def _run_git(args, cwd=None):
 
 def utcnow() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _parse_config_file(config_path: str) -> dict:
+    """Read a git config file into ``{lowercased dotted key: value}``.
+
+    This is deliberately a small, direct reader rather than ``git config
+    --get-regexp``: a dotted key name has to be escaped for git's regex engine,
+    so reading the file avoids that whole class of bug.  Only the flat
+    ``[section]`` / ``key = value`` form git writes is handled, which is all a
+    repository's own ``config`` file ever uses.
+    """
+    values = {}
+    section = None
+    with open(config_path, encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line[0] in "#;":
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip().strip('"').lower()
+                continue
+            if section is None:
+                # The old ``[section.subsection]`` style: only the first dot
+                # separates the section from the variable name.
+                continue
+            key, sep, value = line.partition("=")
+            if not sep:
+                key, value = line, "true"  # ``key`` alone means true
+            values["%s.%s" % (section, key.strip().lower())] = value.strip()
+    return values
+
+
+def _policy_already_local(repo_path: str) -> bool:
+    """True when every policy key is set, with the right value, in this repo.
+
+    Only the repository's own config file counts: a matching value inherited
+    from a system or global config does not make this repository unlimited, so
+    the policy must still be written locally.
+    """
+    config_path = os.path.join(repo_path, "config")
+    if not os.path.isfile(config_path):
+        return False
+    try:
+        local = _parse_config_file(config_path)
+    except OSError:
+        return False
+    return all(
+        local.get(key.lower()) == value
+        for key, value in UNLIMITED_REPO_CONFIG.items()
+    )
+
+
+def _write_config_values(repo_path: str, values: dict) -> None:
+    """Append the missing keys in the same format ``git config`` writes.
+
+    ``git config`` accepts only one key per process, so writing a policy of a
+    dozen keys would cost a dozen spawns; appending to ``config`` is what git
+    itself does.  Because a *later* value wins in git, every section that gets
+    a new key is first rewritten without its old copies of those keys, so the
+    file never accumulates stale duplicates that shadow the policy.
+
+    The write is atomic (temp file + ``os.replace``) so an interrupted run
+    cannot leave a half-written config behind.
+    """
+    config_path = os.path.join(repo_path, "config")
+    sections = {}
+    for key, value in values.items():
+        # git compares section and variable names case-insensitively and writes
+        # them back lowercased, so canonicalise them here: the file then reads
+        # back exactly the way _policy_already_local() parses it.
+        name, _, variable = key.rpartition(".")
+        sections.setdefault(name.lower(), {})[variable.lower()] = value
+
+    kept = []
+    section = None
+    skip_section = False
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            existing = handle.read()
+    except FileNotFoundError:
+        existing = ""
+    for line in existing.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip().strip('"').lower()
+            skip_section = section in sections
+        if skip_section:
+            continue
+        kept.append(line)
+
+    for name, items in sections.items():
+        if kept and kept[-1].strip():
+            kept.append("")
+        kept.append("[%s]" % name)
+        for variable, value in items.items():
+            kept.append("\t%s = %s" % (variable, value))
+
+    tmp = config_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(kept).rstrip("\n") + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, config_path)
+
+
+def apply_unlimited_config(repo_path: str, *, quiet: bool = False) -> None:
+    """Make sure a bare repository carries :data:`UNLIMITED_REPO_CONFIG`.
+
+    Idempotent: once the policy is in place this costs a single read-only
+    ``git`` process and performs no writes.
+
+    With ``quiet`` set, failures are swallowed -- used for pre-existing
+    repositories that may be read-only, or not be git repositories at all.
+    """
+    if _policy_already_local(repo_path):
+        return
+    try:
+        _write_config_values(repo_path, UNLIMITED_REPO_CONFIG)
+    except OSError as exc:
+        # Covers a read-only store and repos that are missing a ``config``
+        # file; with ``quiet`` the caller decided that is not fatal.
+        if not quiet:
+            raise GitusesError(
+                "cannot update the config of %s: %s" % (repo_path, exc)
+            ) from exc
 
 
 class Store:
@@ -141,6 +292,24 @@ class Store:
                 {"version": 1, "token": "", "anonymous": True, "created_at": utcnow()}
             )
 
+    def apply_unlimited_policy(self) -> int:
+        """Re-assert the unlimited policy on every repository in the store.
+
+        Repositories created by an older gituses, or that arrived with
+        provider-style caps, get those caps removed instead of having to be
+        recreated.  Each repository that already complies costs a single
+        read-only ``git`` process, so this is cheap enough to run on every
+        ``serve``.  Returns the number of repositories that changed.
+        """
+        changed = 0
+        for repo in self.list():
+            path = repo["path"]
+            if _policy_already_local(path):
+                continue
+            apply_unlimited_config(path, quiet=True)
+            changed += 1
+        return changed
+
     # -- repositories ---------------------------------------------------
     def repo_path(self, name: str) -> str:
         return os.path.join(self.root, validate_name(name) + ".git")
@@ -160,11 +329,10 @@ class Store:
             raise GitusesError("repository %r already exists" % canonical)
         os.makedirs(self.root, exist_ok=True)
         _run_git(["init", "--bare", "--quiet", path])
-        # Pushing over HTTP is opt-in for git-http-backend; set it explicitly
-        # so hand-created repositories behave the same way.
-        _run_git(["config", "http.receivepack", "true"], cwd=path)
-        _run_git(["config", "uploadpack.allowFilter", "true"], cwd=path)
-        _run_git(["config", "uploadpack.allowAnySHA1InWant", "true"], cwd=path)
+        # Apply the full unlimited policy (receive-pack over HTTP, no push size
+        # or object-count caps, force pushes and deletions allowed, partial
+        # clone support) so every repository behaves the same way.
+        apply_unlimited_config(path)
         # A predictable initial branch avoids the "master" hint noise.
         _run_git(["symbolic-ref", "HEAD", "refs/heads/main"], cwd=path)
         if description:

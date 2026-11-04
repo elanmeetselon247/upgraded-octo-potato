@@ -16,6 +16,7 @@ import html
 import json
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -27,6 +28,10 @@ from .repo import GitusesError, Store, validate_name
 
 CHUNK = 64 * 1024
 REALM = "gituses"
+
+# Accept backlog. socketserver's default is 5, which makes a burst of clones
+# pay with ECONNREFUSED; SOMAXCONN is the kernel's own maximum.
+_SOMAXCONN = getattr(socket, "SOMAXCONN", 4096) or 4096
 
 _GIT_BACKEND = None
 _GIT_BACKEND_LOCK = threading.Lock()
@@ -83,10 +88,31 @@ class GitusesHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self._dispatch()
 
+    def do_PUT(self):
+        # Git's smart HTTP protocol only uses GET and POST.  Answer the rarely
+        # used verbs with a clean 405 instead of http.server's bare 501 so
+        # clients and probes get a consistent, explanatory response.
+        self._dispatch()
+
+    def do_DELETE(self):
+        self._dispatch()
+
+    def do_OPTIONS(self):
+        self._dispatch()
+
+    def do_PATCH(self):
+        self._dispatch()
+
     def _dispatch(self):
         parsed = urlsplit(self.path)
         path = unquote(parsed.path)
         try:
+            if self.command not in ("GET", "HEAD", "POST"):
+                return self._plain(
+                    405,
+                    "method %s not allowed (git smart HTTP uses GET and POST)\n"
+                    % self.command,
+                )
             if path in ("/", "/index.html"):
                 if self.command not in ("GET", "HEAD"):
                     return self._plain(405, "method not allowed\n")
@@ -403,11 +429,19 @@ concurrency limits.</p>
 
 
 class GitusesServer(ThreadingHTTPServer):
-    """Threaded HTTP server; unlimited concurrent connections and repos."""
+    """Threaded HTTP server with no cap on connections, backlog or repos.
+
+    * ``daemon_threads`` + ``ThreadingHTTPServer`` mean one thread per request
+      and no worker pool, so concurrent clone/push counts are bounded only by
+      the machine.
+    * ``request_queue_size`` is raised to the kernel backlog maximum, so a burst
+      of clones does not get ``ECONNREFUSED`` while the accept loop catches up.
+      ``socketserver`` passes this class attribute straight to ``listen()``.
+    """
 
     daemon_threads = True
     allow_reuse_address = True
-    request_queue_size = 128
+    request_queue_size = _SOMAXCONN
 
     def __init__(self, address, store: Store, token: str | None = None):
         self.store = store
